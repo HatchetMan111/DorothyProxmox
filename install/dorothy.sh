@@ -242,7 +242,50 @@ container_mode() {
   fi
   git -C "$INSTALL_DIR" rev-parse --short HEAD | xargs -I{} echo "Checkout: {} ($(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached))"
 
-  msg "[4/6] Abhängigkeiten + Production-Build…"
+  msg "[4/6] Browser-Patch + Abhängigkeiten + Production-Build…"
+
+  # PATCH (DorothyProxmox): crypto.randomUUID() existiert nur in Secure Contexts
+  # (https / localhost). Im LAN über http://<LXC-IP> ist es undefined und die
+  # Web UI crasht sofort ("client-side exception", useTabManager/useState).
+  # -> Helper mit getRandomValues-Fallback + alle direkten Aufrufe ersetzen.
+  # Idempotent: läuft bei jedem Update erneut, ändert nichts wenn schon gepatcht.
+  HELPER_FILE="$INSTALL_DIR/src/lib/safe-uuid.ts"
+  mkdir -p "$INSTALL_DIR/src/lib"
+  if [ ! -f "$HELPER_FILE" ]; then
+    cat > "$HELPER_FILE" <<'HELPER_EOF'
+// Proxmox-LXC-Patch (DorothyProxmox): sichere UUID-Erzeugung im Browser.
+// crypto.randomUUID() gibt es nur in Secure Contexts (https/localhost).
+// Im LAN ueber http://<LXC-IP> waere es undefined -> Client-Crash.
+// Fallback: crypto.getRandomValues (auch insecure verfuegbar), Reserve: Math.random.
+export function safeRandomUUID(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c && typeof c.randomUUID === 'function') {
+    return c.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === 'function') {
+    c.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return (
+    hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' +
+    hex.slice(16, 20) + '-' + hex.slice(20)
+  );
+}
+HELPER_EOF
+    info "Helper src/lib/safe-uuid.ts angelegt."
+  fi
+  while IFS= read -r patchfile; do
+    case "$patchfile" in "$HELPER_FILE") info "übersprungen (Helper): $patchfile"; continue;; esac
+    grep -q "safe-uuid" "$patchfile" || sed -i "0,/^import .*$/s//&\nimport { safeRandomUUID } from '@\/lib\/safe-uuid';/" "$patchfile"
+    sed -i 's/crypto\.randomUUID()/safeRandomUUID()/g' "$patchfile"
+    info "gepatcht: $patchfile"
+  done < <(grep -rl "crypto\.randomUUID()" "$INSTALL_DIR/src" --include='*.ts' --include='*.tsx' 2>/dev/null || true)
+
   cd "$INSTALL_DIR"
   if [ -f package-lock.json ] && command -v npm >/dev/null; then
     npm ci --no-audit --no-fund || npm install --no-audit --no-fund

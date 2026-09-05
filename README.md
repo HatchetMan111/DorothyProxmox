@@ -94,6 +94,22 @@ REPO_REF=main bash /root/dorothy-install.sh
 # oder: cd /opt/dorothy && git pull && npm install && npm run build && systemctl restart dorothy
 ```
 
+## 🩹 Bekannter Fehler (gefixt): `crypto.randomUUID is not a function`
+
+Beim Öffnen über `http://<LXC-IP>:3000` (LAN, kein HTTPS) crashte die Web UI mit
+`Application error: a client-side exception` – `crypto.randomUUID()` existiert nur
+in Secure Contexts (HTTPS/`localhost`). Der Installer patched das automatisch
+(Helper `src/lib/safe-uuid.ts` mit `getRandomValues`-Fallback, seit Commit „randomUUID-Fix“).
+Bei bestehender Installation einmalig im Container:
+
+```bash
+pct enter <CTID>
+REPO_REF=main bash /root/dorothy-install.sh   # patcht + rebuild + restart
+```
+
+Sofort-Workaround ohne Rebuild: per SSH-Tunnel über `http://localhost:3000` öffnen
+(`localhost` ist ein Secure Context).
+
 ## 🗑️ Deinstallieren
 
 ```bash
