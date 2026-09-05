@@ -361,7 +361,9 @@ export function useWebAgents(enabled = true): EA {
     return () => clearInterval(t);
   }, [enabled, fetchAgents]);
 
-  const createAgent = useCallback<EA['createAgent']>(async (config: any) => {
+  // NOTE: Rueckgabe bewusst Promise<any> – der Electron-Typ verlangt ein
+  // Pflichtfeld ptyId, das es im Web-Mode nicht gibt (wird synthetisiert).
+  const createAgent = useCallback<EA['createAgent']>(async (config: any): Promise<any> => {
     if (!config || !config.projectPath) {
       throw new Error('Web-Modus: projectPath ist erforderlich.');
     }
@@ -374,7 +376,8 @@ export function useWebAgents(enabled = true): EA {
       }),
     });
     await fetchAgents();
-    return data.agent as ElectronAgentStatus;
+    const agent = data.agent || {};
+    return { ...agent, ptyId: agent.ptyId || `web-${agent.id || 'new'}` };
   }, [fetchAgents]);
 
   const updateAgent = useCallback<EA['updateAgent']>(async () => {
