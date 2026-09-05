@@ -1,0 +1,17 @@
+[Unit]
+Description=Dorothy – AI Agent Orchestrator Web UI (Port 3000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dorothy
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=0.0.0.0
+ExecStart=/opt/dorothy/node_modules/.bin/next start -H 0.0.0.0 -p 3000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
