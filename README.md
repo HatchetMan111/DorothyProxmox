@@ -86,6 +86,22 @@ Verifikation im Script: `systemctl is-active dorothy` + HTTP-Check auf
 `localhost:3000` (30 × 5 s). Bei Fehlern: **volle Kette** (Exit-Code, Zeile,
 Befehl, Stacktrace, 40 Log-Zeilen, 60 Journal-Zeilen) + `DEBUG=1`-Hinweis.
 
+## 🖥️ Web-Mode: Agents ohne Desktop-App nutzen
+
+Upstream sperrt `/agents` hinter „Desktop App Required“. Der Installer hebt das auf:
+- **REST-Brücke** (`src/hooks/useWebAgents.ts`): Liste/Erstellen/Start/Stop/Löschen über die eingebaute API (`/api/agents/`), Live-Update per Polling
+- **Output-Dialog** statt PTY-Terminal (Start/Stop + Log-Ansicht pro Agent)
+- Im Electron (Desktop-App) ändert sich **nichts** – dort läuft weiter IPC
+
+Voraussetzungen (richtet der Installer ein, Key ggf. interaktiv):
+- `claude`-CLI im Container (`npm i -g @anthropic-ai/claude-code`)
+- `ANTHROPIC_API_KEY` (Env-Var oder Prompt; landet maskiert im systemd-Service).
+  Ohne Key läuft die UI, aber Agents starten nicht.
+
+Grenzen (v1): kein interaktives PTY-Terminal (headless `--print`), kein
+Agent-Edit (`updateAgent` meldet Fehler statt zu crashen), `/templates` bleibt
+gesperrt, Super-Agent/Ordner-Dialoge brauchen Electron.
+
 ## 🔄 Update (idempotent – im Container)
 
 ```bash

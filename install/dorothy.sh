@@ -228,6 +228,14 @@ container_mode() {
   fi
   node -v; npm -v
 
+  # Claude Code CLI (Web-Mode-Agents laufen headless: spawn('claude', --print)).
+  if ! command -v claude >/dev/null 2>&1; then
+    info "Installiere Claude Code CLI (global)…"
+    npm i -g --no-audit --no-fund @anthropic-ai/claude-code || warn "claude-CLI fehlgeschlagen – Web-Mode-Agents brauchen sie (ggf. später: npm i -g @anthropic-ai/claude-code)."
+  else
+    info "claude-CLI bereits vorhanden ($(claude --version 2>/dev/null || echo ok))."
+  fi
+
   msg "[3/6] Repository (idempotent klonen/updaten)…"
   export GIT_TERMINAL_PROMPT=0
   if [ -d "$INSTALL_DIR/.git" ]; then
@@ -286,6 +294,269 @@ HELPER_EOF
     info "gepatcht: $patchfile"
   done < <(grep -rl "crypto\.randomUUID()" "$INSTALL_DIR/src" --include='*.ts' --include='*.tsx' 2>/dev/null || true)
 
+  # PATCH (DorothyProxmox) Web-Mode: /agents + /templates sind upstream hinter
+  # "Desktop App Required" verriegelt. Dahinter liegt REST-fähiger Code, nur die
+  # IPC-Brücke fehlt im Browser. -> useWebAgents-Hook (REST statt Electron-IPC)
+  # + Output-Dialog statt PTY-Terminal + Gate aus agents/page.tsx entfernen.
+  # Idempotent: Dateien werden nur geschrieben wenn neu/unser Marker fehlt,
+  # Seiten-Patch läuft nur wenn noch ungepatcht.
+  msg "[4/6] Web-Mode-Patch (Agents-Seite ohne Desktop-App)…"
+  WEBHOOK_FILE="$INSTALL_DIR/src/hooks/useWebAgents.ts"
+  WEBDIALOG_FILE="$INSTALL_DIR/src/components/AgentList/WebAgentOutputDialog.tsx"
+  for target in "$WEBHOOK_FILE" "$WEBDIALOG_FILE"; do
+    if [ -f "$target" ] && ! grep -q "DorothyProxmox" "$target" 2>/dev/null; then
+      cp "$target" "$target.dorothyproxmox-bak"
+      warn "$target existierte (upstream?) – Backup: $target.dorothyproxmox-bak"
+    fi
+  done
+  cat > "$WEBHOOK_FILE" <<'WEBHOOK_EOF'
+'use client';
+
+// Proxmox-LXC Web-Mode (DorothyProxmox): Agent-Verwaltung ueber die Next.js
+// REST-API statt Electron-IPC. Wird von useAgentsWebOrElectron() genau dann
+// verwendet, wenn kein window.electronAPI existiert (reiner Browser, z. B.
+// http://<LXC-IP>:3000). Signatur identisch zu useElectronAgents, damit
+// src/app/agents/page.tsx unveraendert weiter funktioniert.
+
+import { useState, useEffect, useCallback } from 'react';
+import { useElectronAgents } from './useElectron';
+import type { AgentStatus as ElectronAgentStatus } from '@/types/electron';
+
+type EA = ReturnType<typeof useElectronAgents>;
+
+// Wichtig: trailing Slash (next.config: trailingSlash:true), sonst 308.
+const API = '/api/agents/';
+
+async function req(path: string, init?: RequestInit): Promise<any> {
+  const res = await fetch(path, init);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((data && data.error) || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+export function useWebAgents(enabled = true): EA {
+  const [agents, setAgents] = useState<ElectronAgentStatus[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  const fetchAgents = useCallback(async () => {
+    try {
+      const data = await req(API);
+      setAgents(((data && data.agents) || []) as ElectronAgentStatus[]);
+    } catch (error) {
+      console.error('Web-Mode: failed to fetch agents:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) {
+      setIsLoading(false);
+      return;
+    }
+    fetchAgents();
+    const t = setInterval(fetchAgents, 3000);
+    return () => clearInterval(t);
+  }, [enabled, fetchAgents]);
+
+  const createAgent = useCallback<EA['createAgent']>(async (config: any) => {
+    if (!config || !config.projectPath) {
+      throw new Error('Web-Modus: projectPath ist erforderlich.');
+    }
+    const data = await req(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectPath: config.projectPath,
+        skills: config.skills || [],
+      }),
+    });
+    await fetchAgents();
+    return data.agent as ElectronAgentStatus;
+  }, [fetchAgents]);
+
+  const updateAgent = useCallback<EA['updateAgent']>(async () => {
+    throw new Error('Bearbeiten wird im Web-Modus noch nicht unterstützt (Start/Stop/Löschen gehen).');
+  }, []);
+
+  const startAgent = useCallback<EA['startAgent']>(async (id: string, prompt: string, options?: any) => {
+    if (!prompt) {
+      throw new Error('Web-Modus: bitte einen Prompt angeben (Agent läuft headless mit --print).');
+    }
+    await req(`${API}${id}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'start', prompt, model: options && options.model ? options.model : undefined }),
+    });
+    await fetchAgents();
+  }, [fetchAgents]);
+
+  const stopAgent = useCallback<EA['stopAgent']>(async (id: string) => {
+    await req(`${API}${id}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'stop' }),
+    });
+    await fetchAgents();
+  }, [fetchAgents]);
+
+  const removeAgent = useCallback<EA['removeAgent']>(async (id: string) => {
+    await req(`${API}${id}/`, { method: 'DELETE' });
+    setAgents((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  const sendInput = useCallback<EA['sendInput']>(async (id: string, input: string) => {
+    await req(`${API}${id}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'input', input }),
+    });
+  }, []);
+
+  return {
+    agents,
+    isLoading,
+    isElectron: false,
+    createAgent,
+    updateAgent,
+    startAgent,
+    stopAgent,
+    removeAgent,
+    sendInput,
+    refresh: fetchAgents,
+  };
+}
+
+// Bruecken-Hook fuer src/app/agents/page.tsx: im Electron unveraendert,
+// im Browser (kein window.electronAPI) die REST-Variante. Beide Hooks werden
+// immer aufgerufen (Rules of Hooks), zurueckgegeben wird der passende.
+export function useAgentsWebOrElectron(): EA {
+  const electron = useElectronAgents();
+  const webEnabled = typeof window !== 'undefined' && !electron.isElectron;
+  const web = useWebAgents(webEnabled);
+  if (typeof window !== 'undefined' && !electron.isElectron) {
+    return web;
+  }
+  return electron;
+}
+WEBHOOK_EOF
+  cat > "$WEBDIALOG_FILE" <<'WEBDIALOG_EOF'
+'use client';
+
+// Proxmox-LXC Web-Mode (DorothyProxmox): einfacher Output-Dialog als Ersatz
+// fuer AgentTerminalDialog (der braucht Electron-PTY). Pollt den Agent-Status
+// ueber GET /api/agents/[id]/ und erlaubt Start/Stop. Kein interaktives
+// Terminal (headless --print), kein Edit.
+
+import { useState, useEffect } from 'react';
+
+interface Props {
+  agentId: string | null;
+  open: boolean;
+  onClose: () => void;
+  onStart: (id: string, prompt: string) => void;
+  onStop: (id: string) => void;
+}
+
+export function WebAgentOutputDialog({ agentId, open, onClose, onStart, onStop }: Props) {
+  const [output, setOutput] = useState<string[]>([]);
+  const [status, setStatus] = useState<string>('');
+  const [name, setName] = useState<string>('');
+  const [prompt, setPrompt] = useState<string>('');
+
+  useEffect(() => {
+    if (!open || !agentId) return;
+    let alive = true;
+    const load = async () => {
+      try {
+        const res = await fetch(`/api/agents/${agentId}/`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!alive || !data.agent) return;
+        setOutput(data.agent.output || []);
+        setStatus(data.agent.status || '');
+        setName(data.agent.name || data.agent.currentTask || agentId);
+      } catch {
+        /* offline/noch ladend – still weitermachen */
+      }
+    };
+    load();
+    const t = setInterval(load, 2000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [open, agentId]);
+
+  if (!open || !agentId) return null;
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ width: '100%', maxWidth: 760, maxHeight: '85vh', display: 'flex', flexDirection: 'column', background: '#14161c', color: '#fff', border: '1px solid #333', borderRadius: 8 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <strong style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{name} <span style={{ color: '#888', fontWeight: 'normal' }}>({status || '…'})</span></strong>
+          <button onClick={onClose} style={{ background: 'transparent', color: '#fff', border: '1px solid #555', borderRadius: 4, padding: '2px 10px', cursor: 'pointer' }}>✕</button>
+        </div>
+        <pre style={{ flex: 1, overflow: 'auto', margin: 0, padding: 12, fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word', minHeight: 200 }}>
+          {output.length > 0 ? output.join('\n') : '(noch keine Ausgabe – Agent ggf. starten)'}
+        </pre>
+        <div style={{ padding: 12, borderTop: '1px solid #333', display: 'flex', gap: 8 }}>
+          <input
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Prompt für diesen Agent…"
+            style={{ flex: 1, background: '#0d0e12', color: '#fff', border: '1px solid #555', borderRadius: 4, padding: '6px 10px' }}
+          />
+          <button onClick={() => { if (prompt.trim()) { onStart(agentId, prompt); setPrompt(''); } }} style={{ background: '#2f81f7', color: '#fff', border: 0, borderRadius: 4, padding: '6px 14px', cursor: 'pointer' }}>Start</button>
+          <button onClick={() => onStop(agentId)} style={{ background: 'transparent', color: '#fff', border: '1px solid #555', borderRadius: 4, padding: '6px 14px', cursor: 'pointer' }}>Stop</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+WEBDIALOG_EOF
+  info "Web-Mode-Dateien geschrieben (useWebAgents, WebAgentOutputDialog)."
+
+  PAGE_FILE="$INSTALL_DIR/src/app/agents/page.tsx"
+  if grep -q "useAgentsWebOrElectron" "$PAGE_FILE"; then
+    info "agents/page.tsx bereits im Web-Mode – übersprungen."
+  else
+    grep -q "DesktopRequiredMessage" "$PAGE_FILE" || die "agents/page.tsx enthält kein DesktopRequiredMessage – Upstream-Struktur geändert, Web-Mode-Patch bitte anpassen."
+    python3 - "$PAGE_FILE" <<'PAGEPATCH_EOF'
+import sys
+path = sys.argv[1]
+p = open(path).read()
+def rep(old, new):
+    global p
+    n = p.count(old)
+    assert n == 1, 'Web-Mode-Patch passt nicht auf diese Dorothy-Version (%dx: %r).' % (n, old[:60])
+    p = p.replace(old, new)
+rep("import { useElectronAgents, useElectronFS, useElectronSkills, isElectron } from '@/hooks/useElectron';",
+    "import { useElectronAgents, useElectronFS, useElectronSkills, isElectron } from '@/hooks/useElectron';\nimport { useAgentsWebOrElectron } from '@/hooks/useWebAgents';")
+rep("import AgentTerminalDialog from '@/components/AgentWorld/AgentTerminalDialog';",
+    "import AgentTerminalDialog from '@/components/AgentWorld/AgentTerminalDialog';\nimport { WebAgentOutputDialog } from '@/components/AgentList/WebAgentOutputDialog';")
+rep("  DesktopRequiredMessage,\n", "")
+rep("} = useElectronAgents();",
+    "} = useAgentsWebOrElectron();")
+rep("  // Early returns\n  if (!hasElectron && typeof window !== 'undefined') {\n    return <DesktopRequiredMessage />;\n  }\n",
+    "  // Web-Mode-Patch (DorothyProxmox): kein Desktop-Gate – Browser nutzt REST-Bruecke.\n  const inWebMode = typeof window !== 'undefined' && !hasElectron;\n\n  // Early returns\n")
+rep("      {/* Terminal Dialog — click card body to view */}\n      <AgentTerminalDialog\n",
+    "      {/* Terminal Dialog — click card body to view (Web-Modus: Output-Dialog) */}\n      {inWebMode ? (\n        <WebAgentOutputDialog\n          agentId={viewAgentId}\n          open={!!viewAgentId}\n          onClose={() => setViewAgentId(null)}\n          onStart={(id, prompt) => handleStartAgent(id, prompt)}\n          onStop={stopAgent}\n        />\n      ) : (\n      <AgentTerminalDialog\n")
+rep("        onBrowseFolder={isElectron() ? openFolderDialog : undefined}\n      />\n    </div>",
+    "        onBrowseFolder={isElectron() ? openFolderDialog : undefined}\n      />\n      )}\n    </div>")
+open(path, 'w').write(p)
+print('Web-Mode-Patch auf agents/page.tsx angewendet.')
+PAGEPATCH_EOF
+  fi
+
   cd "$INSTALL_DIR"
   if [ -f package-lock.json ] && command -v npm >/dev/null; then
     npm ci --no-audit --no-fund || npm install --no-audit --no-fund
@@ -297,6 +568,28 @@ HELPER_EOF
   msg "[5/6] systemd-Service '$APP_NAME' (reboot-sicher)…"
   NEXT_BIN="$INSTALL_DIR/node_modules/.bin/next"
   [ -x "$NEXT_BIN" ] || die "next-Binary fehlt: $NEXT_BIN (Build fehlgeschlagen?)"
+
+  # ANTHROPIC_API_KEY für headless Agents (claude --print braucht ihn; im LXC
+  # kein Browser-Login möglich). Priorität: Env > bestehender Eintrag > Prompt.
+  # Der Key wird nie geloggt (set +x rundherum, kein echo).
+  set +x
+  EXISTING_KEY="$(grep -m1 '^Environment=ANTHROPIC_API_KEY=' "/etc/systemd/system/${APP_NAME}.service" 2>/dev/null | cut -d= -f3- || true)"
+  API_KEY=""
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    API_KEY="$ANTHROPIC_API_KEY"
+    info "ANTHROPIC_API_KEY aus Umgebung übernommen (maskiert gespeichert)."
+  elif [ -n "$EXISTING_KEY" ]; then
+    API_KEY="$EXISTING_KEY"
+    info "Bestehender ANTHROPIC_API_KEY im Service wird beibehalten."
+  elif [ -t 0 ]; then
+    echo "Anthropic API-Key für Web-Mode-Agents (https://console.anthropic.com/, Enter=überspringen):"
+    read -rsp "> " API_KEY || API_KEY=""
+    echo ""
+    [ -z "$API_KEY" ] && info "Kein Key eingegeben – Agents starten später nicht, Rest der UI geht. Nachtragen: Service-Environment + restart."
+  else
+    info "Kein Terminal: ANTHROPIC_API_KEY später via Service-Environment nachtragen (sonst starten keine Agents)."
+  fi
+  if [ "$DEBUG" = "1" ]; then set -x; fi
   cat > "/etc/systemd/system/${APP_NAME}.service" <<EOF
 [Unit]
 Description=Dorothy – AI Agent Orchestrator Web UI (Port $PORT)
@@ -317,6 +610,15 @@ NoNewPrivileges=false
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Key maskiert in den Service übernehmen (nie loggen).
+  set +x
+  if [ -n "${API_KEY:-}" ]; then
+    API_KEY_ESC="${API_KEY//&/\\&}"
+    sed -i "/^Environment=HOSTNAME=/a Environment=ANTHROPIC_API_KEY=${API_KEY_ESC}" "/etc/systemd/system/${APP_NAME}.service"
+    info "ANTHROPIC_API_KEY im Service hinterlegt."
+  fi
+  unset API_KEY API_KEY_ESC EXISTING_KEY
+  if [ "$DEBUG" = "1" ]; then set -x; fi
   # Port in LXC-Firewall öffnen (nur wenn ufw aktiv vorhanden)
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "$PORT"/tcp || true
@@ -341,6 +643,9 @@ EOF
     journalctl -u "$APP_NAME" --no-pager -n 60 || true
     die "Web UI antwortet nicht auf http://localhost:${PORT}/ (30 Versuche)."
   }
+  AGENTS_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "http://localhost:${PORT}/api/agents/" || echo 000)"
+  info "Agents-API (/api/agents/): HTTP $AGENTS_CODE $([ "$AGENTS_CODE" = "200" ] && echo "(Web-Mode-Backend bereit)" || echo "(WARNUNG: Web-Mode-Agents evtl. nicht nutzbar)")"
+  if command -v claude >/dev/null 2>&1; then info "claude-CLI: $(claude --version 2>/dev/null || echo vorhanden)"; else warn "claude-CLI fehlt – Agents können nicht starten (npm i -g @anthropic-ai/claude-code)."; fi
 
   IPS="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' || true)"
   cat <<EOF
